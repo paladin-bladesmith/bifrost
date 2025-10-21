@@ -1,0 +1,238 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Bifrost - Send Solana Transaction</title>
+    <style>
+        body {
+            font-family: 'Courier New', monospace;
+            max-width: 900px;
+            margin: 50px auto;
+            padding: 20px;
+            background: #1e1e1e;
+            color: #00ff00;
+        }
+        h1 { color: #00ffff; }
+        button {
+            background: #00ff00;
+            color: #000;
+            border: none;
+            padding: 15px 30px;
+            font-size: 16px;
+            cursor: pointer;
+            font-family: 'Courier New', monospace;
+            margin: 10px 5px;
+        }
+        button:hover { background: #00ffff; }
+        button:disabled {
+            background: #666;
+            cursor: not-allowed;
+        }
+        #log {
+            background: #000;
+            padding: 20px;
+            margin-top: 20px;
+            border: 1px solid #00ff00;
+            white-space: pre-wrap;
+            max-height: 500px;
+            overflow-y: auto;
+        }
+        .error { color: #ff0000; }
+        .success { color: #00ff00; }
+        .info { color: #00ffff; }
+    </style>
+</head>
+<body>
+    <h1>🌉 Bifrost - Browser to TPU</h1>
+    <p>Send Solana transactions directly from browser to validator TPU!</p>
+    
+    <button onclick="testConnection()" id="btn-test">1. Test Connection</button>
+    <button onclick="sendTransaction()" id="btn-tx">2. Send Solana Transaction</button>
+    
+    <div id="log"></div>
+
+    <script src="https://unpkg.com/@solana/web3.js@latest/lib/index.iife.min.js"></script>
+    <script type="module">
+        const logDiv = document.getElementById('log');
+        
+        function log(msg, type = 'info') {
+            const timestamp = new Date().toLocaleTimeString();
+            const className = type === 'error' ? 'error' : type === 'success' ? 'success' : 'info';
+            const line = document.createElement('div');
+            line.className = className;
+            line.textContent = `[${timestamp}] ${msg}`;
+            logDiv.appendChild(line);
+            logDiv.scrollTop = logDiv.scrollHeight;
+            console.log(msg);
+        }
+
+        // Load certificate hash
+        const fingerprintHex = await fetch('./certs/localhost.hex')
+            .then(r => r.text())
+            .then(text => text.trim());
+
+        let fingerprint = [];
+        for (let c = 0; c < fingerprintHex.length - 1; c += 2) {
+            fingerprint.push(parseInt(fingerprintHex.substring(c, c + 2), 16));
+        }
+
+        window.testConnection = async function() {
+            logDiv.innerHTML = '';
+            document.getElementById('btn-test').disabled = true;
+            
+            try {
+                log('🔌 Testing connection to Bifrost...', 'info');
+                
+                const transport = new WebTransport("https://localhost:4433", {
+                    serverCertificateHashes: [{
+                        "algorithm": "sha-256",
+                        "value": new Uint8Array(fingerprint),
+                    }],
+                });
+                
+                await transport.ready;
+                log('✅ Connected to Bifrost!', 'success');
+
+                const stream = await transport.createBidirectionalStream();
+                const writer = stream.writable.getWriter();
+                const reader = stream.readable.getReader();
+
+                const msg = 'Hello from browser!';
+                await writer.write(new TextEncoder().encode(msg));
+                await writer.close();
+                log('📤 Sent: ' + msg, 'info');
+
+                const { value } = await reader.read();
+                const response = new TextDecoder().decode(value);
+                log('📥 Response: ' + response, 'success');
+
+                transport.close();
+                log('✅ Test complete!', 'success');
+                
+            } catch (error) {
+                log('❌ Error: ' + error.message, 'error');
+                console.error(error);
+            } finally {
+                document.getElementById('btn-test').disabled = false;
+            }
+        };
+
+        window.sendTransaction = async function() {
+            logDiv.innerHTML = '';
+            document.getElementById('btn-tx').disabled = true;
+            
+            try {
+                log('🚀 Creating Solana transaction...', 'info');
+                
+                // Connect to local Solana RPC
+                const connection = new solanaWeb3.Connection('http://localhost:8899', 'confirmed');
+                log('Connected to local validator', 'info');
+                
+                // Generate keypair
+                const payer = solanaWeb3.Keypair.generate();
+                log('Generated keypair: ' + payer.publicKey.toBase58(), 'info');
+                
+                // Request airdrop
+                log('Requesting 2 SOL airdrop...', 'info');
+                const airdropSig = await connection.requestAirdrop(
+                    payer.publicKey,
+                    2 * solanaWeb3.LAMPORTS_PER_SOL
+                );
+                
+                log('Waiting for airdrop confirmation...', 'info');
+                await connection.confirmTransaction(airdropSig);
+                log('✅ Airdrop confirmed!', 'success');
+                
+                const balance = await connection.getBalance(payer.publicKey);
+                log(`Balance: ${balance / solanaWeb3.LAMPORTS_PER_SOL} SOL`, 'info');
+                
+                // Get rent-exempt amount
+                const rentExempt = await connection.getMinimumBalanceForRentExemption(0);
+                log(`Rent-exempt: ${rentExempt} lamports`, 'info');
+                
+                // Create transaction
+                const recipient = solanaWeb3.Keypair.generate().publicKey;
+                log('Recipient: ' + recipient.toBase58(), 'info');
+                
+                const transaction = new solanaWeb3.Transaction().add(
+                    solanaWeb3.SystemProgram.transfer({
+                        fromPubkey: payer.publicKey,
+                        toPubkey: recipient,
+                        lamports: rentExempt + 2_000_000,
+                    })
+                );
+                
+                transaction.recentBlockhash = (await connection.getLatestBlockhash()).blockhash;
+                transaction.feePayer = payer.publicKey;
+                transaction.sign(payer);
+                
+                const signature = transaction.signatures[0].signature;
+                // Convert Uint8Array to base64 without Buffer
+                const sigBase64 = btoa(String.fromCharCode.apply(null, signature));
+                log('Transaction signature: ' + sigBase64.substring(0, 20) + '...', 'info');
+                
+                // Serialize
+                const serializedTx = transaction.serialize();
+                log(`Transaction size: ${serializedTx.length} bytes`, 'info');
+                
+                // Connect to Bifrost
+                log('📡 Connecting to Bifrost...', 'info');
+                const transport = new WebTransport("https://localhost:4433", {
+                    serverCertificateHashes: [{
+                        "algorithm": "sha-256",
+                        "value": new Uint8Array(fingerprint),
+                    }],
+                });
+                
+                await transport.ready;
+                log('✅ Connected to Bifrost!', 'success');
+                
+                // Send transaction
+                log('📤 Sending transaction via WebTransport...', 'info');
+                const stream = await transport.createBidirectionalStream();
+                const writer = stream.writable.getWriter();
+                const reader = stream.readable.getReader();
+                
+                await writer.write(serializedTx);
+                await writer.close();
+                log('Transaction sent to TPU!', 'success');
+                
+                // Read response
+                const { value } = await reader.read();
+                const response = new TextDecoder().decode(value);
+                log('📥 Bifrost response: ' + response, 'success');
+                
+                await transport.close();
+                
+                // Wait a bit then check on-chain
+                log('Waiting 2 seconds for confirmation...', 'info');
+                await new Promise(resolve => setTimeout(resolve, 2000));
+                
+                // Check if transaction landed
+                try {
+                    const status = await connection.getSignatureStatus(sigBase64);
+                    if (status && status.value) {
+                        log('✅ Transaction confirmed on-chain!', 'success');
+                        log(`Confirmations: ${status.value.confirmations || 'finalized'}`, 'info');
+                    } else {
+                        log('Transaction status unknown (might still be processing)', 'info');
+                    }
+                } catch (e) {
+                    log('Could not check transaction status: ' + e.message, 'info');
+                }
+                
+                log('', 'info');
+                log('🎉 SUCCESS! Transaction sent from browser → Bifrost → TPU!', 'success');
+                log(`Check recipient balance: solana balance ${recipient.toBase58()} -u localhost`, 'info');
+                
+            } catch (error) {
+                log('❌ Error: ' + error.message, 'error');
+                console.error(error);
+            } finally {
+                document.getElementById('btn-tx').disabled = false;
+            }
+        };
+        
+        log('Ready! Click a button to start.', 'success');
+    </script>
+</body>
+</html>
