@@ -5,10 +5,10 @@ use quinn::{
     ClientConfig, Connection, Endpoint, IdleTimeout, TransportConfig,
     crypto::rustls::QuicClientConfig,
 };
-use solana_sdk::transaction::Transaction;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use std::u8;
 
 const ALPN_TPU_PROTOCOL_ID: &[u8] = b"solana-tpu";
 const QUIC_MAX_TIMEOUT: Duration = Duration::from_secs(30);
@@ -90,13 +90,10 @@ impl TpuConnectionManager {
     pub async fn send_transaction(
         &self,
         validator: &str,
-        transaction: &Transaction,
+        tx_data: &[u8],
     ) -> Result<DeliveryConfirmation> {
         let start = Instant::now();
-        
-        let tx_data = bincode::serialize(transaction)
-            .context("Failed to serialize transaction")?;
-        
+
         info!("Sending {} bytes to {}", tx_data.len(), validator);
         debug!("Packet preview: {:02x?}", &tx_data[..tx_data.len().min(32)]);
 

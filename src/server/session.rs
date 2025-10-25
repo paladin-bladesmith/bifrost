@@ -55,7 +55,7 @@ pub async fn handle_session(
 
                 // Forward the deserialized transaction to TPU
                 info!("Forwarding transaction to TPU at {}", DEFAULT_TPU_ADDRESS);
-                match tpu_manager.send_transaction(DEFAULT_TPU_ADDRESS, &transaction).await {
+                match tpu_manager.send_transaction(DEFAULT_TPU_ADDRESS, &tx_data).await {
                     Ok(confirmation) => {
                         info!(
                             "Transaction forwarded successfully (latency: {:?})",
