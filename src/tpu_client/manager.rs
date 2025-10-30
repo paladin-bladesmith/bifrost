@@ -121,6 +121,7 @@ impl TpuConnectionManager {
     }
 
     /// Gets an existing connection or creates a new one to the validator.
+    /// TODO: Connect to future leaders based on LeaderTracker
     async fn get_or_create_connection(&self, validator: &str) -> Result<Connection> {
         if let Some(conn) = self.connections.get(validator) {
             if !conn.close_reason().is_some() {

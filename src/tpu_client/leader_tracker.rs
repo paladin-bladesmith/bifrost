@@ -1,235 +1,214 @@
-//! Leader Schedule Construction Without RPC
-//!
-//! This module should implement Solana's leader schedule algorithm locally, computing the same
-//! deterministic schedule that all validators use without calling `getLeaderSchedule` RPC.
-//!
-//! To build the leader schedule, we need:
-//!
-//! 1. **Stake Data** - Map of `Pubkey → u64` stake amounts for each validator
-//!    - Fetch once per epoch via `getVoteAccounts` RPC and cache
-//!    - Alternative: Parse stake account state from ledger/shreds
-//!
-//! 2. **Epoch Number** - The epoch for which to compute the schedule
-//!    - Calculate from: current_slot / slots_per_epoch
-//!
-//! 3. **Slots Per Epoch** - Total slots in the epoch (e.g., 432,000 on mainnet)
-//!    - Fetch once via `getEpochSchedule` RPC and cache
-//!    - Or use known constant for your cluster
-//!
-//! Once we have this data, compute the schedule locally and cache it for the entire epoch.
-//!
-//! Core Algorithm: `stake_weighted_slot_leaders()`
-//!
-//! The Agave algorithm from `agave/ledger/src/leader_schedule.rs`:
-//!
-//! ```rust,ignore
-//! use rand::distributions::{Distribution, WeightedIndex};
-//! use rand_chacha::{rand_core::SeedableRng, ChaChaRng};
-//!
-//! fn stake_weighted_slot_leaders(
-//!     mut keyed_stakes: Vec<(&Pubkey, u64)>,
-//!     epoch: u64,
-//!     len: u64,      // slots_per_epoch
-//!     repeat: u64,   // NUM_CONSECUTIVE_LEADER_SLOTS = 4
-//! ) -> Vec<Pubkey> {
-//!     // Step 1: Deterministic sorting
-//!     sort_stakes(&mut keyed_stakes);
-//!     
-//!     // Step 2: Separate keys and weights
-//!     let (keys, stakes): (Vec<_>, Vec<_>) = keyed_stakes.into_iter().unzip();
-//!     
-//!     // Step 3: Create weighted distribution
-//!     let weighted_index = WeightedIndex::new(stakes).unwrap();
-//!     
-//!     // Step 4: Seed deterministic RNG with epoch
-//!     let mut seed = [0u8; 32];
-//!     seed[0..8].copy_from_slice(&epoch.to_le_bytes());
-//!     let rng = &mut ChaChaRng::from_seed(seed);
-//!     
-//!     // Step 5: Generate schedule with leader chunks
-//!     let mut current_slot_leader = Pubkey::default();
-//!     (0..len)
-//!         .map(|i| {
-//!             if i % repeat == 0 {
-//!                 current_slot_leader = keys[weighted_index.sample(rng)];
-//!             }
-//!             current_slot_leader
-//!         })
-//!         .collect()
-//! }
-//!
-//! fn sort_stakes(stakes: &mut Vec<(&Pubkey, u64)>) {
-//!     // Sort by stake DESC, then pubkey DESC for determinism
-//!     stakes.sort_unstable_by(|(l_pubkey, l_stake), (r_pubkey, r_stake)| {
-//!         if r_stake == l_stake {
-//!             r_pubkey.cmp(l_pubkey)  // Tie-breaker
-//!         } else {
-//!             r_stake.cmp(l_stake)
-//!         }
-//!     });
-//!     stakes.dedup();
-//! }
-//! ```
-//!
-//! Algorithm Breakdown
-//!
-//! i: Deterministic Sorting
-//!
-//! Validators must be sorted identically on all nodes:
-//! - **Primary sort**: By stake amount (highest first)
-//! - **Tie-breaker**: By pubkey (reverse lexicographic order)
-//! - **Deduplication**: Remove any duplicate entries
-//!
-//! ```rust,ignore
-//! // Example stakes before sorting:
-//! [
-//!     (Pubkey("AAA..."), 1000),
-//!     (Pubkey("BBB..."), 1000),  // Same stake
-//!     (Pubkey("CCC..."), 500),
-//! ]
-//!
-//! // After sorting:
-//! [
-//!     (Pubkey("BBB..."), 1000),  // Higher pubkey wins tie
-//!     (Pubkey("AAA..."), 1000),
-//!     (Pubkey("CCC..."), 500),
-//! ]
-//! ```
-//!
-//! ii: Weighted Distribution
-//!
-//! Use `rand::distributions::WeightedIndex` to create a probability distribution:
-//! - Validators with more stake get selected more frequently
-//! - Probability of selection = validator_stake / total_stake
-//!
-//! iii: Deterministic RNG
-//!
-//! Seed ChaCha20 RNG with the epoch number:
-//! - `seed[0..8] = epoch.to_le_bytes()`
-//! - All nodes use identical seed → identical random sequence
-//! - Schedule is deterministic and verifiable
-//!
-//! Step iv: 4-Slot Leader Chunks
-//!
-//! Leaders are assigned in groups of 4 consecutive slots:
-//! - Slot 0-3: Leader A
-//! - Slot 4-7: Leader B
-//! - Slot 8-11: Leader C
-//! - etc.
-//!
-//! Every 4th slot (when `i % 4 == 0`), sample a new leader from the weighted distribution.
-//!
-//! ## Implementation Example
-//!
-//! ```rust,ignore
-//! use std::collections::HashMap;
-//! use solana_sdk::pubkey::Pubkey;
-//! use rand::distributions::{Distribution, WeightedIndex};
-//! use rand_chacha::{rand_core::SeedableRng, ChaChaRng};
-//!
-//! pub struct LeaderScheduleBuilder {
-//!     stakes: HashMap<Pubkey, u64>,
-//!     epoch: u64,
-//!     slots_per_epoch: u64,
-//! }
-//!
-//! impl LeaderScheduleBuilder {
-//!     pub fn new(stakes: HashMap<Pubkey, u64>, epoch: u64, slots_per_epoch: u64) -> Self {
-//!         Self { stakes, epoch, slots_per_epoch }
-//!     }
-//!     
-//!     pub fn build(&self) -> Vec<Pubkey> {
-//!         // Collect and sort stakes
-//!         let mut keyed_stakes: Vec<_> = self.stakes.iter()
-//!             .map(|(pk, stake)| (pk, *stake))
-//!             .collect();
-//!         
-//!         keyed_stakes.sort_unstable_by(|(l_pk, l_stake), (r_pk, r_stake)| {
-//!             if r_stake == l_stake {
-//!                 r_pk.cmp(l_pk)
-//!             } else {
-//!                 r_stake.cmp(l_stake)
-//!             }
-//!         });
-//!         keyed_stakes.dedup();
-//!         
-//!         // Build weighted distribution
-//!         let (keys, stakes): (Vec<_>, Vec<_>) = keyed_stakes.into_iter().unzip();
-//!         let weighted_index = WeightedIndex::new(stakes).unwrap();
-//!         
-//!         // Seed RNG with epoch
-//!         let mut seed = [0u8; 32];
-//!         seed[0..8].copy_from_slice(&self.epoch.to_le_bytes());
-//!         let rng = &mut ChaChaRng::from_seed(seed);
-//!         
-//!         // Generate schedule
-//!         let mut current_leader = Pubkey::default();
-//!         (0..self.slots_per_epoch)
-//!             .map(|i| {
-//!                 if i % 4 == 0 {
-//!                     current_leader = *keys[weighted_index.sample(rng)];
-//!                 }
-//!                 current_leader
-//!             })
-//!             .collect()
-//!     }
-//! }
-//! ```
-//!
-//! Getting Stake Data
-//!
-//! - From RPC (fetch once, cache for epoch)
-//!
-//! ```rust,ignore
-//! // Fetch stake data once per epoch
-//! let vote_accounts = rpc_client.get_vote_accounts().await?;
-//! let stakes: HashMap<Pubkey, u64> = vote_accounts
-//!     .current
-//!     .iter()
-//!     .map(|account| (account.node_pubkey, account.activated_stake))
-//!     .collect();
-//!
-//! // Build and cache schedule for entire epoch
-//! let schedule = LeaderScheduleBuilder::new(stakes, epoch, slots_per_epoch).build();
-//! ```
-//!
-//! - From Shreds (no RPC)
-//!
-//! Track stake account updates from shreds containing vote transactions:
-//! - Parse vote state updates from shreds
-//! - Track delegations and activations
-//! - Maintain epoch boundary snapshots
-//! - Requires replicating Bank's stake calculation logic
-//!
-//! From Ledger/Snapshot (no RPC)
-//!
-//! - Load stake accounts from ledger or snapshot
-//! - Query stake account state at epoch boundaries
-//! - Compute activated stake from account data
-//! - Requires ledger access or snapshot parsing
-//!
-//! Usage Pattern
-//!
-//! ```rust,ignore
-//! // One-time setup per epoch
-//! let stakes = fetch_stakes_once(epoch).await?;
-//! let builder = LeaderScheduleBuilder::new(stakes, epoch, 432_000);
-//! let schedule = builder.build();  // Vec<Pubkey> with 432,000 entries
-//!
-//! // Look up leader for any slot (no RPC needed)
-//! let slot = 123_456;
-//! let slot_in_epoch = slot % 432_000;
-//! let leader_pubkey = schedule[slot_in_epoch as usize];
-//!
-//! // Map leader to TPU address using gossip ClusterInfo
-//! let tpu_address = cluster_info.lookup_contact_info(&leader_pubkey, |ci| {
-//!     ci.tpu(Protocol::QUIC)
-//! })?;
-//! ```
-//!
-//!
-//! Constants
-//!
-//! - `NUM_CONSECUTIVE_LEADER_SLOTS`: 4
-//! - `SLOTS_PER_EPOCH` (mainnet): 432,000
-//! - `SLOTS_PER_EPOCH` (devnet/testnet): Varies
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use futures_util::stream::StreamExt;
+use solana_client::nonblocking::pubsub_client::PubsubClient;
+use solana_client::nonblocking::rpc_client::RpcClient;
+use tokio::sync::RwLock;
+
+const RPC_URL: &str = "https://api.testnet.solana.com";
+const WS_RPC_URL: &str = "wss://api.testnet.solana.com/";
+
+#[derive(Default)]
+struct LeaderTracker {
+    curr_slot: u64,
+    slots_in_epoch: u64,
+    curr_epoch_slot_start: u64,
+    next_epoch_slot_start: u64,
+    /// Slot index > leader identity
+    curr_schedule: HashMap<usize, String>,
+    next_schedule: HashMap<usize, String>,
+}
+
+impl LeaderTracker {
+    async fn new() -> Self {
+        let rpc_client = RpcClient::new(RPC_URL.to_string());
+
+        let epoch_info = rpc_client
+            .get_epoch_info()
+            .await
+            .expect("Failed to get epoch info");
+
+        // let epoch_schedule = rpc_client
+        //     .get_epoch_schedule()
+        //     .await
+        //     .expect("Failed to get epoch schedule");
+
+        // TODO: We assume `leader_schedule_slot_offset` is equal to `epoch_info.slots_in_epoch`
+        // Otherwise, it will be hard to know when schedule started in epoch
+        let curr_epoch_slot_start = epoch_info.absolute_slot - epoch_info.slot_index;
+        let next_epoch_slot_start = curr_epoch_slot_start + epoch_info.slots_in_epoch;
+
+        let leader_ips = LeaderTracker::get_leaders_ips(&rpc_client).await;
+        let curr_schedule = LeaderTracker::get_leader_schedule(
+            &rpc_client,
+            curr_epoch_slot_start,
+            leader_ips.clone(),
+        )
+        .await;
+        let next_schedule =
+            LeaderTracker::get_leader_schedule(&rpc_client, next_epoch_slot_start, leader_ips)
+                .await;
+
+        Self {
+            curr_slot: epoch_info.absolute_slot,
+            slots_in_epoch: epoch_info.slots_in_epoch,
+            curr_epoch_slot_start,
+            next_epoch_slot_start,
+            curr_schedule,
+            next_schedule,
+        }
+    }
+
+    /// Get the current and next `amount-1`` leader ips
+    fn get_leaders(&self, amount: u8) -> Vec<String> {
+        let mut leaders = vec![];
+        for i in 0..amount {
+            let slot = self.curr_slot + i as u64 * 4;
+
+            let (slot_index, schedule) = if slot >= self.next_epoch_slot_start {
+                (slot - self.next_epoch_slot_start, &self.next_schedule)
+            } else {
+                (slot - self.curr_epoch_slot_start, &self.curr_schedule)
+            };
+
+            if let Some(ip) = schedule.get(&(slot_index as usize)) {
+                leaders.push(ip.clone());
+            }
+        }
+
+        leaders
+    }
+
+    /// Get leader schedule for given slot
+    async fn get_leader_schedule(
+        rpc_client: &RpcClient,
+        slot: u64,
+        leader_ips: HashMap<String, String>,
+    ) -> HashMap<usize, String> {
+        let mut schedule: HashMap<usize, String> = HashMap::new();
+
+        let tmp_schedule = rpc_client
+            .get_leader_schedule(Some(slot))
+            .await
+            .expect("Failed to fetch leader schedule from RPC")
+            .expect("No leader schedule for this slot");
+
+        tmp_schedule.iter().for_each(|(val, slots)| {
+            if let Some(ip) = leader_ips.get(val) {
+                slots.iter().for_each(|slot| {
+                    schedule.insert(*slot, ip.clone());
+                });
+            }
+        });
+        schedule
+    }
+
+    /// Get all cluster node leader IPs
+    /// TODO: We don't get all leaders in schedule ips, check why
+    /// TODO: We want to do period ip updates for the schedules to keep ips up to date
+    /// and not try to connect to a hotswap node or something
+    async fn get_leaders_ips(rpc_client: &RpcClient) -> HashMap<String, String> {
+        let mut leader_ips: HashMap<String, String> = HashMap::new();
+
+        let nodes = rpc_client
+            .get_cluster_nodes()
+            .await
+            .expect("Failed to get cluster nodes");
+
+        nodes.iter().for_each(|node| {
+            if let Some(tpu_quic) = node.tpu_quic {
+                leader_ips.insert(node.pubkey.to_string(), tpu_quic.to_string());
+            }
+        });
+
+        leader_ips
+    }
+
+    /// Run the slot updates listener
+    pub async fn slot_updates(leader_tracker: Arc<RwLock<Self>>) {
+        let ws_client = PubsubClient::new(WS_RPC_URL).await.unwrap();
+
+        let (mut slot_notifications, unsubscribe) = ws_client.slot_subscribe().await.unwrap();
+        println!("Subscribed to slot updates");
+        println!("\nListening for slot updates...\n");
+
+        while let Some(slot_info) = slot_notifications.next().await {
+            let mut leader_tracker_write = leader_tracker.write().await;
+
+            // Don't update slot to a past slot
+            if slot_info.slot + 1 <= leader_tracker_write.curr_slot {
+                continue;
+            }
+
+            leader_tracker_write.curr_slot = slot_info.slot + 1;
+
+            // If slot is from next epoch, update tracker
+            if slot_info.slot >= leader_tracker_write.next_epoch_slot_start {
+                // curr epoch slot start
+                leader_tracker_write.curr_epoch_slot_start =
+                    leader_tracker_write.next_epoch_slot_start;
+
+                // Set next epoch slot start
+                leader_tracker_write.next_epoch_slot_start = leader_tracker_write
+                    .next_epoch_slot_start
+                    + leader_tracker_write.slots_in_epoch;
+
+                // set curr schedule to next schedule
+                leader_tracker_write.curr_schedule = std::mem::take(&mut leader_tracker_write.next_schedule);
+
+                let next_epoch_slot_start = leader_tracker_write.next_epoch_slot_start;
+                drop(leader_tracker_write);
+
+                let leader_tracker_clone = leader_tracker.clone();
+                tokio::spawn(async move {
+                    let rpc_client = RpcClient::new(RPC_URL.to_string());
+
+                    let leader_ips = LeaderTracker::get_leaders_ips(&rpc_client).await;
+                    let next_schedule = LeaderTracker::get_leader_schedule(
+                        &rpc_client,
+                        next_epoch_slot_start,
+                        leader_ips,
+                    )
+                    .await;
+                    let mut leader_tracker = leader_tracker_clone.write().await;
+                    leader_tracker.next_schedule = next_schedule;
+                });
+            }
+        }
+
+        // TODO: Handle closing the subscription properly
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use solana_sdk::epoch_info;
+    use tokio::{runtime::Runtime, time::sleep};
+
+    use super::*;
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_get_rpc_leader_schedule() {
+        let leader_tracker: Arc<RwLock<LeaderTracker>> =
+            Arc::new(RwLock::new(LeaderTracker::new().await));
+
+        let leader_tracker_clone = leader_tracker.clone();
+        tokio::spawn(async move {
+            LeaderTracker::slot_updates(leader_tracker_clone).await;
+        });
+
+        loop {
+            let lt = leader_tracker.read().await;
+            println!(
+                "Current Slot: {},leaders: {:?}",
+                lt.curr_slot,
+                lt.get_leaders(2)
+            );
+            sleep(Duration::from_millis(400)).await;
+        }
+    }
+}

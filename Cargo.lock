@@ -292,6 +292,7 @@ dependencies = [
  "bincode",
  "dashmap 6.1.0",
  "env_logger",
+ "futures-util",
  "log",
  "quinn",
  "rustls 0.23.33",
