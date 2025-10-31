@@ -5,10 +5,13 @@ use quinn::{
     ClientConfig, Connection, Endpoint, IdleTimeout, TransportConfig,
     crypto::rustls::QuicClientConfig,
 };
+use tokio::sync::RwLock;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use std::u8;
+
+use crate::tpu_client::LeaderTracker;
 
 const ALPN_TPU_PROTOCOL_ID: &[u8] = b"solana-tpu";
 const QUIC_MAX_TIMEOUT: Duration = Duration::from_secs(30);
@@ -24,9 +27,11 @@ pub struct DeliveryConfirmation {
 /// Manages QUIC connections to Solana TPU endpoints.
 ///
 /// Maintains a connection pool and handles automatic reconnection.
+#[derive(Debug)]
 pub struct TpuConnectionManager {
     endpoint: Endpoint,
     connections: Arc<DashMap<String, Connection>>,
+    leader_tracker: Arc<RwLock<LeaderTracker>>,
 }
 
 impl TpuConnectionManager {
@@ -35,7 +40,7 @@ impl TpuConnectionManager {
     /// # Errors
     ///
     /// Returns an error if the QUIC endpoint cannot be initialized.
-    pub fn new() -> Result<Self> {
+    pub fn new(leader_tracker: Arc<RwLock<LeaderTracker>>) -> Result<Self> {
         info!("Creating TPU connection manager");
 
         let client_certificate = solana_tls_utils::QuicClientCertificate::new(None);
@@ -70,6 +75,7 @@ impl TpuConnectionManager {
         Ok(Self {
             endpoint,
             connections: Arc::new(DashMap::new()),
+            leader_tracker,
         })
     }
 
@@ -172,13 +178,16 @@ mod tests {
 
     #[test]
     fn test_manager_creation() {
-        let manager = TpuConnectionManager::new();
+        let leader_tracker = Arc::new(RwLock::new(LeaderTracker::default()));
+        let manager = TpuConnectionManager::new(leader_tracker);
+        println!("TPU Connection Manager creation result: {:?}", manager);
         assert!(manager.is_ok());
     }
 
     #[test]
     fn test_connection_count() {
-        let manager = TpuConnectionManager::new().unwrap();
+        let leader_tracker = Arc::new(RwLock::new(LeaderTracker::default()));
+        let manager = TpuConnectionManager::new(leader_tracker).unwrap();
         assert_eq!(manager.connection_count(), 0);
     }
 }

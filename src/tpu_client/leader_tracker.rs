@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use futures_util::stream::StreamExt;
+use log::info;
 use solana_client::nonblocking::pubsub_client::PubsubClient;
 use solana_client::nonblocking::rpc_client::RpcClient;
 use tokio::sync::RwLock;
@@ -9,8 +10,8 @@ use tokio::sync::RwLock;
 const RPC_URL: &str = "https://api.testnet.solana.com";
 const WS_RPC_URL: &str = "wss://api.testnet.solana.com/";
 
-#[derive(Default)]
-struct LeaderTracker {
+#[derive(Default, Debug)]
+pub struct LeaderTracker {
     curr_slot: u64,
     slots_in_epoch: u64,
     curr_epoch_slot_start: u64,
@@ -21,18 +22,13 @@ struct LeaderTracker {
 }
 
 impl LeaderTracker {
-    async fn new() -> Self {
+    pub async fn new() -> Self {
         let rpc_client = RpcClient::new(RPC_URL.to_string());
 
         let epoch_info = rpc_client
             .get_epoch_info()
             .await
             .expect("Failed to get epoch info");
-
-        // let epoch_schedule = rpc_client
-        //     .get_epoch_schedule()
-        //     .await
-        //     .expect("Failed to get epoch schedule");
 
         // TODO: We assume `leader_schedule_slot_offset` is equal to `epoch_info.slots_in_epoch`
         // Otherwise, it will be hard to know when schedule started in epoch
@@ -61,7 +57,7 @@ impl LeaderTracker {
     }
 
     /// Get the current and next `amount-1`` leader ips
-    fn get_leaders(&self, amount: u8) -> Vec<String> {
+    pub fn get_leaders(&self, amount: u8) -> Vec<String> {
         let mut leaders = vec![];
         for i in 0..amount {
             let slot = self.curr_slot + i as u64 * 4;
@@ -130,8 +126,7 @@ impl LeaderTracker {
         let ws_client = PubsubClient::new(WS_RPC_URL).await.unwrap();
 
         let (mut slot_notifications, unsubscribe) = ws_client.slot_subscribe().await.unwrap();
-        println!("Subscribed to slot updates");
-        println!("\nListening for slot updates...\n");
+        info!("Listening for slot updates...\n");
 
         while let Some(slot_info) = slot_notifications.next().await {
             let mut leader_tracker_write = leader_tracker.write().await;
