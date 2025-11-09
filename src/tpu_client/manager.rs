@@ -1,15 +1,15 @@
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use dashmap::DashMap;
 use log::{debug, info};
 use quinn::{
     ClientConfig, Connection, Endpoint, IdleTimeout, TransportConfig,
     crypto::rustls::QuicClientConfig,
 };
-use tokio::sync::RwLock;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use std::u8;
+use tokio::sync::RwLock;
 
 use crate::tpu_client::LeaderTracker;
 
@@ -30,7 +30,7 @@ pub struct DeliveryConfirmation {
 #[derive(Debug)]
 pub struct TpuConnectionManager {
     endpoint: Endpoint,
-    connections: Arc<DashMap<String, Connection>>,
+    connections: Arc<RwLock<DashMap<String, Connection>>>,
     leader_tracker: Arc<RwLock<LeaderTracker>>,
 }
 
@@ -74,7 +74,7 @@ impl TpuConnectionManager {
 
         Ok(Self {
             endpoint,
-            connections: Arc::new(DashMap::new()),
+            connections: Arc::new(RwLock::new(DashMap::new())),
             leader_tracker,
         })
     }
@@ -93,17 +93,29 @@ impl TpuConnectionManager {
     /// - Connection fails
     /// - Stream creation fails
     /// - Data transmission fails
-    pub async fn send_transaction(
-        &self,
-        validator: &str,
-        tx_data: &[u8],
-    ) -> Result<DeliveryConfirmation> {
+    pub async fn send_transaction(&self, tx_data: &[u8]) -> Result<DeliveryConfirmation> {
         let start = Instant::now();
+        // TODO: Handle a retry with timeout from user
+        let validator = self
+            .leader_tracker
+            .read()
+            .await
+            .get_leaders(1)
+            .get(0)
+            .cloned()
+            .ok_or_else(|| anyhow!("No leader available to send transaction"))?;
 
         info!("Sending {} bytes to {}", tx_data.len(), validator);
         debug!("Packet preview: {:02x?}", &tx_data[..tx_data.len().min(32)]);
 
-        let connection = self.get_or_create_connection(validator).await?;
+        let connection = self.get_or_create_connection(validator.as_str()).await?;
+
+        // TODO: remove after tests
+        info!("Connection established {:?}", connection.rtt());
+        return Ok(DeliveryConfirmation {
+            delivered: true,
+            latency: start.elapsed(),
+        });
 
         let mut send_stream = connection
             .open_uni()
@@ -117,7 +129,7 @@ impl TpuConnectionManager {
 
         send_stream.finish().context("Failed to finish stream")?;
 
-        let latency = start.elapsed();
+        let latency: Duration = start.elapsed();
         debug!("Transaction sent in {:?}", latency);
 
         Ok(DeliveryConfirmation {
@@ -127,42 +139,51 @@ impl TpuConnectionManager {
     }
 
     /// Gets an existing connection or creates a new one to the validator.
-    /// TODO: Connect to future leaders based on LeaderTracker
-    async fn get_or_create_connection(&self, validator: &str) -> Result<Connection> {
-        if let Some(conn) = self.connections.get(validator) {
+    pub async fn get_or_create_connection(&self, validator: &str) -> Result<Connection> {
+        let conns = self.connections.read().await;
+        if let Some(conn) = conns.get(validator) {
             if !conn.close_reason().is_some() {
                 debug!("Reusing connection to {}", validator);
                 return Ok(conn.clone());
             }
         }
+        drop(conns);
 
         info!("Creating new connection to {}", validator);
         let addr: SocketAddr = validator.parse().context("Invalid validator address")?;
 
-        let connection = self
-            .endpoint
-            .connect(addr, "solana")?
-            .await
-            .context("Failed to connect to validator")?;
+        let connection = match self.endpoint.connect(addr, "solana")?.into_0rtt() {
+            Ok((conn, rtt_accepted)) => {
+                if !rtt_accepted.await {
+                    info!("0-RTT accepted");
+                }
+                conn
+            }
+            Err(e) => {
+                info!("0-RTT not accepted, waiting for handshake to complete");
+                e.await?
+            }
+        };
 
-        self.connections.insert(validator.to_string(), connection.clone());
+        self.connections.write().await
+            .insert(validator.to_string(), connection.clone());
         info!("Connected to {}", validator);
 
         Ok(connection)
     }
 
-
     /// Returns the number of active connections.
-    pub fn connection_count(&self) -> usize {
-        self.connections.len()
+    pub async fn connection_count(&self) -> usize {
+        self.connections.read().await.len()
     }
 
     /// Closes all connections.
-    pub fn close_all(&self) {
-        for conn in self.connections.iter() {
+    pub async fn close_all(&self) {
+        let connections = self.connections.write().await;
+        for conn in connections.iter() {
             conn.value().close(0u32.into(), b"shutdown");
         }
-        self.connections.clear();
+        connections.clear();
     }
 }
 
@@ -184,10 +205,10 @@ mod tests {
         assert!(manager.is_ok());
     }
 
-    #[test]
-    fn test_connection_count() {
+    #[tokio::test]
+    async fn test_connection_count() {
         let leader_tracker = Arc::new(RwLock::new(LeaderTracker::default()));
         let manager = TpuConnectionManager::new(leader_tracker).unwrap();
-        assert_eq!(manager.connection_count(), 0);
+        assert_eq!(manager.connection_count().await, 0);
     }
 }

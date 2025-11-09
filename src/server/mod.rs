@@ -64,12 +64,44 @@ impl BifrostServer {
                 .context("Failed to create TPU manager")?,
         );
 
+        //
+        let manager_clone = tpu_manager.clone();
+        let leader_tracker_clone = leader_tracker.clone();
+        tokio::spawn(async move {
+            loop {
+                info!("Connecting to future leaders");
+                let lt_read = leader_tracker_clone.read().await;
+                let leaders = lt_read.get_leaders(4);
+                drop(lt_read);
+
+                for leader in leaders {
+                    let mc = manager_clone.clone();
+                    tokio::spawn(async move {
+                        mc.get_or_create_connection(&leader).await.ok();
+                    });
+                }
+
+                tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+            }
+        });
+
         let mut server = web_transport_quinn::ServerBuilder::new()
             .with_addr(self.addr)
             .with_certificate(cert_chain, private_key)?;
 
         info!("Listening for WebTransport connections");
         info!("Waiting for first connection");
+
+        let manager_clone = tpu_manager.clone();
+        tokio::spawn(async move {
+            loop {
+                match manager_clone.send_transaction(&[]).await {
+                    Ok(_) => info!("TPU connection healthy"),
+                    Err(e) => log::error!("TPU health check failed: {}", e),
+                };
+                tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+            }
+        });
 
         while let Some(request) = server.accept().await {
             info!("Server received request: {}", request.url());
