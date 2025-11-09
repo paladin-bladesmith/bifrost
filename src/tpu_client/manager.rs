@@ -31,7 +31,7 @@ pub struct DeliveryConfirmation {
 pub struct TpuConnectionManager {
     endpoint: Endpoint,
     connections: Arc<RwLock<DashMap<String, Connection>>>,
-    leader_tracker: Arc<RwLock<LeaderTracker>>,
+    leader_tracker: Arc<LeaderTracker>,
 }
 
 impl TpuConnectionManager {
@@ -40,7 +40,7 @@ impl TpuConnectionManager {
     /// # Errors
     ///
     /// Returns an error if the QUIC endpoint cannot be initialized.
-    pub fn new(leader_tracker: Arc<RwLock<LeaderTracker>>) -> Result<Self> {
+    pub fn new(leader_tracker: Arc<LeaderTracker>) -> Result<Self> {
         info!("Creating TPU connection manager");
 
         let client_certificate = solana_tls_utils::QuicClientCertificate::new(None);
@@ -96,19 +96,17 @@ impl TpuConnectionManager {
     pub async fn send_transaction(&self, tx_data: &[u8]) -> Result<DeliveryConfirmation> {
         let start = Instant::now();
         // TODO: Handle a retry with timeout from user
-        let validator = self
+        let (validator_identity, validator_tpu_socket) = self
             .leader_tracker
-            .read()
-            .await
-            .get_leaders(1)
+            .get_leaders().await
             .get(0)
             .cloned()
             .ok_or_else(|| anyhow!("No leader available to send transaction"))?;
 
-        info!("Sending {} bytes to {}", tx_data.len(), validator);
+        info!("Sending {} bytes to {} at: {}", tx_data.len(), validator_identity, validator_tpu_socket);
         debug!("Packet preview: {:02x?}", &tx_data[..tx_data.len().min(32)]);
 
-        let connection = self.get_or_create_connection(validator.as_str()).await?;
+        let connection = self.get_or_create_connection(&validator_tpu_socket).await?;
 
         // TODO: remove after tests
         info!("Connection established {:?}", connection.rtt());
@@ -199,7 +197,7 @@ mod tests {
 
     #[test]
     fn test_manager_creation() {
-        let leader_tracker = Arc::new(RwLock::new(LeaderTracker::default()));
+        let leader_tracker = Arc::new(LeaderTracker::default());
         let manager = TpuConnectionManager::new(leader_tracker);
         println!("TPU Connection Manager creation result: {:?}", manager);
         assert!(manager.is_ok());
@@ -207,7 +205,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_connection_count() {
-        let leader_tracker = Arc::new(RwLock::new(LeaderTracker::default()));
+        let leader_tracker = Arc::new(LeaderTracker::default());
         let manager = TpuConnectionManager::new(leader_tracker).unwrap();
         assert_eq!(manager.connection_count().await, 0);
     }
