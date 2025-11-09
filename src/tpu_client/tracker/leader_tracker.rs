@@ -45,10 +45,7 @@ impl LeaderTracker {
         }
     }
 
-    /// Get the current and next leaders if
-    /// Output = (leader identity, leader socket)
-    // TODO: Get ips
-    pub async fn get_leaders(&self) -> Vec<(String, String)> {
+    pub async fn get_future_leaders(&self, slots_amount: u64) -> Vec<(String, String)> {
         let slot_tracker = self.slots_tracker.read().await;
         let curr_slot = slot_tracker.get_slot();
         drop(slot_tracker);
@@ -57,11 +54,9 @@ impl LeaderTracker {
         let schedule_tracker = self.schedule_tracker.read().await;
         let leader_sockets = self.leader_sockets.read().await;
 
-        // TODO: Customize num of slots to look for leaders (next N leaders)
         // Get current leader and next slot leader if different leader
-        for i in 0..2 {
+        for i in 0..slots_amount {
             // Get the index of the slot
-            println!("{} | {}", curr_slot, schedule_tracker.curr_epoch_slot_start);
             let slot_index = (curr_slot + i - schedule_tracker.curr_epoch_slot_start) as usize;
 
             // If we have this index in our schedule and not a duplicate add to leaders vector
@@ -74,6 +69,12 @@ impl LeaderTracker {
         }
 
         leaders
+    }
+
+    /// Get the current and next leaders
+    /// Output = (leader identity, leader socket)
+    pub async fn get_leaders(&self) -> Vec<(String, String)> {
+        self.get_future_leaders(2).await
     }
 
     /// Get all cluster node leader IPs
@@ -166,7 +167,7 @@ impl LeaderTracker {
 mod tests {
     use std::time::Duration;
 
-    use tokio::{time::sleep};
+    use tokio::time::sleep;
 
     use super::*;
 
