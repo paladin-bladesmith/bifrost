@@ -5,7 +5,6 @@ use quinn::{
     ClientConfig, Connection, Endpoint, IdleTimeout, TransportConfig,
     crypto::rustls::QuicClientConfig,
 };
-use tokio::sync::RwLock;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -31,7 +30,7 @@ pub struct DeliveryConfirmation {
 pub struct TpuConnectionManager {
     endpoint: Endpoint,
     connections: Arc<DashMap<String, Connection>>,
-    leader_tracker: Arc<RwLock<LeaderTracker>>,
+    leader_tracker: Arc<LeaderTracker>,
 }
 
 impl TpuConnectionManager {
@@ -40,7 +39,7 @@ impl TpuConnectionManager {
     /// # Errors
     ///
     /// Returns an error if the QUIC endpoint cannot be initialized.
-    pub fn new(leader_tracker: Arc<RwLock<LeaderTracker>>) -> Result<Self> {
+    pub fn new(leader_tracker: Arc<LeaderTracker>) -> Result<Self> {
         info!("Creating TPU connection manager");
 
         let client_certificate = solana_tls_utils::QuicClientCertificate::new(None);
@@ -178,7 +177,7 @@ mod tests {
 
     #[test]
     fn test_manager_creation() {
-        let leader_tracker = Arc::new(RwLock::new(LeaderTracker::default()));
+        let leader_tracker = Arc::new(LeaderTracker::default());
         let manager = TpuConnectionManager::new(leader_tracker);
         println!("TPU Connection Manager creation result: {:?}", manager);
         assert!(manager.is_ok());
@@ -186,7 +185,7 @@ mod tests {
 
     #[test]
     fn test_connection_count() {
-        let leader_tracker = Arc::new(RwLock::new(LeaderTracker::default()));
+        let leader_tracker = Arc::new(LeaderTracker::default());
         let manager = TpuConnectionManager::new(leader_tracker).unwrap();
         assert_eq!(manager.connection_count(), 0);
     }
