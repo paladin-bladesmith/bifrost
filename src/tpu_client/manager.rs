@@ -2,9 +2,10 @@ use anyhow::{Context, Result, anyhow};
 use dashmap::DashMap;
 use log::{debug, info};
 use quinn::{
-    ClientConfig, Connection, Endpoint, IdleTimeout, TransportConfig,
+    ClientConfig, Connection as QuinnConnection, Endpoint, IdleTimeout, TransportConfig,
     crypto::rustls::QuicClientConfig,
 };
+use solana_client::connection_cache;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -14,7 +15,7 @@ use tokio::sync::RwLock;
 use crate::tpu_client::LeaderTracker;
 
 const ALPN_TPU_PROTOCOL_ID: &[u8] = b"solana-tpu";
-const QUIC_MAX_TIMEOUT: Duration = Duration::from_secs(30);
+const QUIC_MAX_TIMEOUT: Duration = Duration::from_secs(10);
 const QUIC_KEEP_ALIVE: Duration = Duration::from_secs(5);
 
 /// Result of a transaction delivery attempt.
@@ -22,6 +23,11 @@ const QUIC_KEEP_ALIVE: Duration = Duration::from_secs(5);
 pub struct DeliveryConfirmation {
     pub delivered: bool,
     pub latency: Duration,
+}
+
+#[derive(Default, Debug)]
+pub struct Connection {
+    conn: Option<QuinnConnection>,
 }
 
 /// Manages QUIC connections to Solana TPU endpoints.
@@ -96,14 +102,19 @@ impl TpuConnectionManager {
     pub async fn send_transaction(&self, tx_data: &[u8]) -> Result<DeliveryConfirmation> {
         let start = Instant::now();
         // TODO: Handle a retry with timeout from user
-        let (validator_identity, validator_tpu_socket) = self
-            .leader_tracker
-            .get_leaders().await
+        let leaders = self.leader_tracker.get_leaders().await;
+        println!("leadesr: {:#?}", leaders);
+        let (validator_identity, validator_tpu_socket) = leaders
             .get(0)
             .cloned()
             .ok_or_else(|| anyhow!("No leader available to send transaction"))?;
 
-        info!("Sending {} bytes to {} at: {}", tx_data.len(), validator_identity, validator_tpu_socket);
+        info!(
+            "Sending {} bytes to {} at: {}",
+            tx_data.len(),
+            validator_identity,
+            validator_tpu_socket
+        );
         debug!("Packet preview: {:02x?}", &tx_data[..tx_data.len().min(32)]);
 
         let connection = self.get_or_create_connection(&validator_tpu_socket).await?;
@@ -136,15 +147,43 @@ impl TpuConnectionManager {
         })
     }
 
-    /// Gets an existing connection or creates a new one to the validator.
-    pub async fn get_or_create_connection(&self, validator: &str) -> Result<Connection> {
+    pub async fn get_connection(&self, validator: &str) -> Result<Option<QuinnConnection>> {
         let conns = self.connections.read().await;
+
         if let Some(conn) = conns.get(validator) {
-            if !conn.close_reason().is_some() {
-                debug!("Reusing connection to {}", validator);
-                return Ok(conn.clone());
+            // If we are already connected check connection is active
+            match &conn.conn {
+                Some(conn) => {
+                    if conn.close_reason().is_none() {
+                        debug!("Reusing connection to {}", validator);
+                        return Ok(Some(conn.clone()));
+                    }
+                }
+                None => return Err(anyhow!("")),
             }
         }
+
+        return Ok(None);
+    }
+
+    /// Gets an existing connection or creates a new one to the validator.
+    pub async fn get_or_create_connection(&self, validator: &str) -> Result<QuinnConnection> {
+        match self.get_connection(validator).await {
+            // we have active connection
+            Ok(Some(conn)) => return Ok(conn),
+            // We have no connection, try to connect
+            Ok(None) => (),
+            // We are trying to connect right now
+            Err(_) => return Err(anyhow!("Already connecting")),
+        }
+
+        let conns = self.connections.write().await;
+        if let Some(conn) = conns.get(validator)
+            && let None = conn.conn
+        {
+            return Err(anyhow!("Already connecting"));
+        }
+        conns.insert(validator.to_string(), Connection::default());
         drop(conns);
 
         info!("Creating new connection to {}", validator);
@@ -152,19 +191,32 @@ impl TpuConnectionManager {
 
         let connection = match self.endpoint.connect(addr, "solana")?.into_0rtt() {
             Ok((conn, rtt_accepted)) => {
-                if !rtt_accepted.await {
+                info!("Waiting for 0-RTT for: {}", addr);
+
+                if rtt_accepted.await {
                     info!("0-RTT accepted");
                 }
                 conn
             }
-            Err(e) => {
+            Err(connecting) => {
                 info!("0-RTT not accepted, waiting for handshake to complete");
-                e.await?
+                match connecting.await {
+                    Ok(conn) => conn,
+                    Err(e) => {
+                        // Failed to connect, return error and remove from list of connections
+                        self.connections.write().await.remove(validator);
+                        return Err(e.into());
+                    }
+                }
             }
         };
 
-        self.connections.write().await
-            .insert(validator.to_string(), connection.clone());
+        self.connections.write().await.insert(
+            validator.to_string(),
+            Connection {
+                conn: Some(connection.clone()),
+            },
+        );
         info!("Connected to {}", validator);
 
         Ok(connection)
@@ -179,7 +231,9 @@ impl TpuConnectionManager {
     pub async fn close_all(&self) {
         let connections = self.connections.write().await;
         for conn in connections.iter() {
-            conn.value().close(0u32.into(), b"shutdown");
+            if let Some(conn) = &conn.value().conn {
+                conn.close(0u32.into(), b"shutdown");
+            }
         }
         connections.clear();
     }

@@ -71,13 +71,13 @@ impl BifrostServer {
                 .context("Failed to create TPU manager")?,
         );
 
-        //
+        // spawn task to auto connect to future 
         let manager_clone = tpu_manager.clone();
         let leader_tracker_clone = leader_tracker.clone();
         tokio::spawn(async move {
             loop {
                 info!("Connecting to future leaders");
-                let leaders = leader_tracker_clone.get_leaders().await;
+                let leaders = leader_tracker_clone.get_future_leaders(10 * 4).await;
 
                 for (_, leader_socket) in leaders {
                     let mc = manager_clone.clone();
@@ -86,7 +86,7 @@ impl BifrostServer {
                     });
                 }
 
-                tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
             }
         });
 

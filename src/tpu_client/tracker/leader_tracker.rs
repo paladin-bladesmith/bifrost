@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::fs::File;
 use std::sync::Arc;
 
 use futures_util::stream::StreamExt;
@@ -7,6 +8,7 @@ use solana_client::nonblocking::pubsub_client::PubsubClient;
 use solana_client::nonblocking::rpc_client::RpcClient;
 use tokio::sync::RwLock;
 use tokio::time::Instant;
+use std::io::Write;
 
 use crate::tpu_client::tracker::schedule_tracking::ScheduleTracker;
 use crate::tpu_client::tracker::slots_tracker::SlotsTracker;
@@ -45,21 +47,21 @@ impl LeaderTracker {
         }
     }
 
-    /// Get the current and next leaders if
-    /// Output = (leader identity, leader socket)
-    // TODO: Get ips
-    pub async fn get_leaders(&self) -> Vec<(String, String)> {
+    pub async fn get_future_leaders(&self, slots_amount: u64) -> Vec<(String, String)> {
         let slot_tracker = self.slots_tracker.read().await;
         let curr_slot = slot_tracker.get_slot();
         drop(slot_tracker);
+
+        if curr_slot == 0 {
+            return vec![];
+        }
 
         let mut leaders = vec![];
         let schedule_tracker = self.schedule_tracker.read().await;
         let leader_sockets = self.leader_sockets.read().await;
 
-        // TODO: Customize num of slots to look for leaders (next N leaders)
         // Get current leader and next slot leader if different leader
-        for i in 0..2 {
+        for i in 0..slots_amount {
             // Get the index of the slot
             let slot_index = (curr_slot + i - schedule_tracker.curr_epoch_slot_start) as usize;
 
@@ -75,9 +77,13 @@ impl LeaderTracker {
         leaders
     }
 
+    /// Get the current and next leaders
+    /// Output = (leader identity, leader socket)
+    pub async fn get_leaders(&self) -> Vec<(String, String)> {
+        self.get_future_leaders(2).await
+    }
+
     /// Get all cluster node leader IPs
-    /// TODO: We want to do period ip updates for the schedules to keep ips up to date
-    /// and not try to connect to a hotswap node or something
     pub async fn update_leader_sockets(leader_tracker: Arc<LeaderTracker>) {
         let mut leader_sockets: HashMap<String, String> = HashMap::new();
         let rpc_client = RpcClient::new(RPC_URL.to_string());
@@ -88,13 +94,18 @@ impl LeaderTracker {
             .expect("Failed to get cluster nodes");
 
         nodes.iter().for_each(|node| {
-            if let Some(tpu_quic) = node.tpu_quic {
-                leader_sockets.insert(node.pubkey.to_string(), tpu_quic.to_string());
+            if let Some(tpu_quic) = node.tpu_quic && let Some(gossip) = node.gossip {
+                leader_sockets.insert(node.pubkey.to_string(), format!("{}:{}", gossip.ip(), tpu_quic.port()));
             }
         });
 
         let mut ls = leader_tracker.leader_sockets.write().await;
-        *ls = leader_sockets;
+        *ls = leader_sockets.clone();
+
+        let mut file = File::create("output.txt").unwrap();
+
+        // You can also use write! or writeln! macros with a File
+        writeln!(file, "{:#?}", leader_sockets).unwrap();
     }
 
     /// Run the slot updates listener
@@ -106,7 +117,6 @@ impl LeaderTracker {
         info!("Listening for slot updates...\n");
 
         while let Some(slot_event) = slot_notifications.next().await {
-            let time = Instant::now();
             let mut slot_tracker_lock = leader_tracker.slots_tracker.write().await;
 
             // Update slot tracker
@@ -152,9 +162,6 @@ impl LeaderTracker {
                     schedule_tracker.next_schedule = next_schedule;
                 });
             }
-
-            let elapsed = time.elapsed();
-            println!("Curr slot: {} | process time: {:?}", curr_slot, elapsed)
         }
 
         // TODO: Handle closing the subscription properly
@@ -165,7 +172,7 @@ impl LeaderTracker {
 mod tests {
     use std::time::Duration;
 
-    use tokio::{time::sleep};
+    use tokio::time::sleep;
 
     use super::*;
 
