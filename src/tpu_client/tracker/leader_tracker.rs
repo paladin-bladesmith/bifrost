@@ -120,10 +120,8 @@ impl LeaderTracker {
             let mut slot_tracker_lock = leader_tracker.slots_tracker.write().await;
 
             // Update slot tracker
-            {
-                if let None = slot_tracker_lock.record(slot_event) {
-                    continue;
-                }
+            if let None = slot_tracker_lock.record(slot_event) {
+                continue;
             }
 
             let curr_slot = slot_tracker_lock.get_slot();

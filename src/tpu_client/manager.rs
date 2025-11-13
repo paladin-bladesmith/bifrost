@@ -253,7 +253,6 @@ mod tests {
     fn test_manager_creation() {
         let leader_tracker = Arc::new(LeaderTracker::default());
         let manager = TpuConnectionManager::new(leader_tracker);
-        println!("TPU Connection Manager creation result: {:?}", manager);
         assert!(manager.is_ok());
     }
 
