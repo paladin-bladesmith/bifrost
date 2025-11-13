@@ -29,7 +29,6 @@ impl ScheduleTracker {
         let curr_epoch_slot_start = epoch_info.absolute_slot - epoch_info.slot_index;
         let next_epoch_slot_start = curr_epoch_slot_start + epoch_info.slots_in_epoch;
 
-        // let leader_ips = LeaderTracker::get_leaders_ips(&rpc_client).await;
         let curr_schedule =
             Self::get_leader_schedule(&rpc_client, Some(curr_epoch_slot_start)).await;
         let next_schedule =

@@ -49,7 +49,7 @@ impl LeaderTracker {
         let slot_tracker = self.slots_tracker.read().await;
         let curr_slot = slot_tracker.get_slot();
         drop(slot_tracker);
-        
+
         if curr_slot == 0 {
             return vec![];
         }
@@ -112,14 +112,11 @@ impl LeaderTracker {
         info!("Listening for slot updates...\n");
 
         while let Some(slot_event) = slot_notifications.next().await {
-            let time = Instant::now();
             let mut slot_tracker_lock = leader_tracker.slots_tracker.write().await;
 
             // Update slot tracker
-            {
-                if let None = slot_tracker_lock.record(slot_event) {
-                    continue;
-                }
+            if let None = slot_tracker_lock.record(slot_event) {
+                continue;
             }
 
             let curr_slot = slot_tracker_lock.get_slot();
@@ -158,9 +155,6 @@ impl LeaderTracker {
                     schedule_tracker.next_schedule = next_schedule;
                 });
             }
-
-            let elapsed = time.elapsed();
-            println!("Curr slot: {} | process time: {:?}", curr_slot, elapsed)
         }
 
         // TODO: Handle closing the subscription properly
