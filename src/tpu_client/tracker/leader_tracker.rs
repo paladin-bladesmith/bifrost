@@ -49,6 +49,10 @@ impl LeaderTracker {
         let slot_tracker = self.slots_tracker.read().await;
         let curr_slot = slot_tracker.get_slot();
         drop(slot_tracker);
+        
+        if curr_slot == 0 {
+            return vec![];
+        }
 
         let mut leaders = vec![];
         let schedule_tracker = self.schedule_tracker.read().await;
