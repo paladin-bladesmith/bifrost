@@ -107,7 +107,7 @@ impl TpuConnectionManager {
         println!("leaders: {:#?}", leaders);
 
         for (leader_identity, leader_socket, curr_slot) in leaders {
-            info!("Slot: {}", curr_slot);
+            
             if let Ok(Some(conn)) = self.get_connection(&leader_socket).await {
                 info!(
                     "Sending {} bytes to {} at: {}",
@@ -214,7 +214,8 @@ impl TpuConnectionManager {
                 conn: Some(connection.clone()),
             },
         );
-        info!("Connected to {}", validator);
+        
+        debug!("Connected to {}", validator);
 
         Ok(connection)
     }

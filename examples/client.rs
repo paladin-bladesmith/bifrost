@@ -30,19 +30,19 @@ async fn main() -> anyhow::Result<()> {
     let session = connect_to_bifrost().await?;
     println!("Connected to Bifrost successfully");
 
-    let transaction = create_test_transaction().await?;
-    println!(
-        "Created transaction with signature: {}",
-        transaction.signatures[0]
-    );
-
     let mut success = vec![];
-    for _ in 0..100 {
+    for _ in 0..10 {
+        let transaction = create_test_transaction().await?;
+        println!(
+            "Created transaction with signature: {}",
+            transaction.signatures[0]
+        );
+
         match send_transaction(&session, transaction.clone()).await {
             Ok(_) => success.push(true),
             Err(_) => (),
         };
-        sleep(Duration::from_secs(1));
+        sleep(Duration::from_millis(1200));
     }
 
     println!(
