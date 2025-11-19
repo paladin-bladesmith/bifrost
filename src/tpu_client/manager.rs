@@ -5,7 +5,6 @@ use quinn::{
     ClientConfig, Connection as QuinnConnection, Endpoint, IdleTimeout, TransportConfig,
     crypto::rustls::QuicClientConfig,
 };
-use solana_client::connection_cache;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -15,8 +14,8 @@ use tokio::sync::RwLock;
 use crate::tpu_client::LeaderTracker;
 
 const ALPN_TPU_PROTOCOL_ID: &[u8] = b"solana-tpu";
-const QUIC_MAX_TIMEOUT: Duration = Duration::from_secs(10);
-const QUIC_KEEP_ALIVE: Duration = Duration::from_secs(5);
+const QUIC_MAX_TIMEOUT: Duration = Duration::from_secs(5);
+const QUIC_KEEP_ALIVE: Duration = Duration::from_secs(4);
 
 /// Result of a transaction delivery attempt.
 #[derive(Debug, Clone)]
@@ -100,50 +99,48 @@ impl TpuConnectionManager {
     /// - Stream creation fails
     /// - Data transmission fails
     pub async fn send_transaction(&self, tx_data: &[u8]) -> Result<DeliveryConfirmation> {
-        let start = Instant::now();
-        // TODO: Handle a retry with timeout from user
-        let leaders = self.leader_tracker.get_leaders().await;
-        println!("leadesr: {:#?}", leaders);
-        let (validator_identity, validator_tpu_socket) = leaders
-            .get(0)
-            .cloned()
-            .ok_or_else(|| anyhow!("No leader available to send transaction"))?;
-
-        info!(
-            "Sending {} bytes to {} at: {}",
-            tx_data.len(),
-            validator_identity,
-            validator_tpu_socket
-        );
         debug!("Packet preview: {:02x?}", &tx_data[..tx_data.len().min(32)]);
 
-        let connection = self.get_or_create_connection(&validator_tpu_socket).await?;
+        let start = Instant::now();
+        let leaders = self.leader_tracker.get_leaders().await;
+        let mut tx_sent = false;
+        println!("leaders: {:#?}", leaders);
 
-        // TODO: remove after tests
-        info!("Connection established {:?}", connection.rtt());
-        return Ok(DeliveryConfirmation {
-            delivered: true,
-            latency: start.elapsed(),
-        });
+        for (leader_identity, leader_socket, curr_slot) in leaders {
+            info!("Slot: {}", curr_slot);
+            if let Ok(Some(conn)) = self.get_connection(&leader_socket).await {
+                info!(
+                    "Sending {} bytes to {} at: {}",
+                    tx_data.len(),
+                    leader_identity,
+                    leader_socket
+                );
 
-        let mut send_stream = connection
-            .open_uni()
-            .await
-            .context("Failed to open uni stream")?;
+                let mut send_stream = conn.open_uni().await.context("Failed to open uni stream")?;
 
-        send_stream
-            .write_all(&tx_data)
-            .await
-            .context("Failed to write transaction data")?;
+                send_stream
+                    .write_all(&tx_data)
+                    .await
+                    .context("Failed to write transaction data")?;
 
-        send_stream.finish().context("Failed to finish stream")?;
+                send_stream.finish().context("Failed to finish stream")?;
 
-        let latency: Duration = start.elapsed();
-        debug!("Transaction sent in {:?}", latency);
+                tx_sent = true;
+            } else {
+                info!(
+                    "Connection failed for {} at: {}",
+                    leader_identity, leader_socket
+                );
+            };
+        }
+
+        if !tx_sent {
+            return Err(anyhow!("Failed sending TX"));
+        }
 
         Ok(DeliveryConfirmation {
             delivered: true,
-            latency,
+            latency: start.elapsed(),
         })
     }
 
@@ -159,7 +156,7 @@ impl TpuConnectionManager {
                         return Ok(Some(conn.clone()));
                     }
                 }
-                None => return Err(anyhow!("")),
+                None => return Err(anyhow!("No connection is open")),
             }
         }
 
@@ -173,7 +170,7 @@ impl TpuConnectionManager {
             Ok(Some(conn)) => return Ok(conn),
             // We have no connection, try to connect
             Ok(None) => (),
-            // We are trying to connect right now
+            // We are are still trying to connect
             Err(_) => return Err(anyhow!("Already connecting")),
         }
 
@@ -186,20 +183,20 @@ impl TpuConnectionManager {
         conns.insert(validator.to_string(), Connection::default());
         drop(conns);
 
-        info!("Creating new connection to {}", validator);
+        debug!("Creating new connection to {}", validator);
         let addr: SocketAddr = validator.parse().context("Invalid validator address")?;
 
         let connection = match self.endpoint.connect(addr, "solana")?.into_0rtt() {
             Ok((conn, rtt_accepted)) => {
-                info!("Waiting for 0-RTT for: {}", addr);
+                debug!("Waiting for 0-RTT for: {}", addr);
 
                 if rtt_accepted.await {
-                    info!("0-RTT accepted");
+                    debug!("0-RTT accepted");
                 }
                 conn
             }
             Err(connecting) => {
-                info!("0-RTT not accepted, waiting for handshake to complete");
+                debug!("0-RTT not accepted, waiting for handshake to complete");
                 match connecting.await {
                     Ok(conn) => conn,
                     Err(e) => {
@@ -241,7 +238,9 @@ impl TpuConnectionManager {
 
 impl Drop for TpuConnectionManager {
     fn drop(&mut self) {
-        self.close_all();
+        let handle = tokio::runtime::Handle::current();
+
+        handle.block_on(self.close_all());
     }
 }
 

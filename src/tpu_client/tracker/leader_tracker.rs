@@ -6,9 +6,8 @@ use futures_util::stream::StreamExt;
 use log::info;
 use solana_client::nonblocking::pubsub_client::PubsubClient;
 use solana_client::nonblocking::rpc_client::RpcClient;
-use tokio::sync::RwLock;
-use tokio::time::Instant;
 use std::io::Write;
+use tokio::sync::RwLock;
 
 use crate::tpu_client::tracker::schedule_tracking::ScheduleTracker;
 use crate::tpu_client::tracker::slots_tracker::SlotsTracker;
@@ -47,7 +46,7 @@ impl LeaderTracker {
         }
     }
 
-    pub async fn get_future_leaders(&self, slots_amount: u64) -> Vec<(String, String)> {
+    pub async fn get_future_leaders(&self, start: u64, end: u64) -> Vec<(String, String, u64)> {
         let slot_tracker = self.slots_tracker.read().await;
         let curr_slot = slot_tracker.get_slot();
         drop(slot_tracker);
@@ -61,26 +60,27 @@ impl LeaderTracker {
         let leader_sockets = self.leader_sockets.read().await;
 
         // Get current leader and next slot leader if different leader
-        for i in 0..slots_amount {
+        for i in start..end {
             // Get the index of the slot
             let slot_index = (curr_slot + i - schedule_tracker.curr_epoch_slot_start) as usize;
 
             // If we have this index in our schedule and not a duplicate add to leaders vector
             if let Some(leader) = schedule_tracker.curr_schedule.get(&slot_index)
                 && let Some(leader_socket) = leader_sockets.get(leader)
-                && !leaders.contains(&(leader.to_string(), leader_socket.to_string()))
+                && !leaders.contains(&(leader.to_string(), leader_socket.to_string(), curr_slot))
             {
-                leaders.push((leader.clone(), leader_socket.clone()));
+                leaders.push((leader.clone(), leader_socket.clone(), curr_slot));
             }
         }
 
         leaders
     }
 
-    /// Get the current and next leaders
-    /// Output = (leader identity, leader socket)
-    pub async fn get_leaders(&self) -> Vec<(String, String)> {
-        self.get_future_leaders(2).await
+    /// Get the current leader, and next leader if close to leader switch
+    ///
+    /// Output = Vec<(leader identity, leader socket, current slot)>
+    pub async fn get_leaders(&self) -> Vec<(String, String, u64)> {
+        self.get_future_leaders(0, 2).await
     }
 
     /// Get all cluster node leader IPs
@@ -94,8 +94,13 @@ impl LeaderTracker {
             .expect("Failed to get cluster nodes");
 
         nodes.iter().for_each(|node| {
-            if let Some(tpu_quic) = node.tpu_quic && let Some(gossip) = node.gossip {
-                leader_sockets.insert(node.pubkey.to_string(), format!("{}:{}", gossip.ip(), tpu_quic.port()));
+            if let Some(tpu_quic) = node.tpu_quic
+                && let Some(gossip) = node.gossip
+            {
+                leader_sockets.insert(
+                    node.pubkey.to_string(),
+                    format!("{}:{}", gossip.ip(), tpu_quic.port()),
+                );
             }
         });
 

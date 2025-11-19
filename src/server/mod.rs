@@ -9,7 +9,7 @@ use tokio::time::sleep;
 
 use crate::tpu_client::{LeaderTracker, TpuConnectionManager};
 use anyhow::{Context, Result};
-use log::info;
+use log::{debug, info};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -71,15 +71,15 @@ impl BifrostServer {
                 .context("Failed to create TPU manager")?,
         );
 
-        // spawn task to auto connect to future 
+        // spawn task to auto connect to future
         let manager_clone = tpu_manager.clone();
         let leader_tracker_clone = leader_tracker.clone();
         tokio::spawn(async move {
             loop {
-                info!("Connecting to future leaders");
-                let leaders = leader_tracker_clone.get_future_leaders(10 * 4).await;
+                debug!("Connecting to future leaders");
+                let leaders = leader_tracker_clone.get_future_leaders(0, 10 * 4).await;
 
-                for (_, leader_socket) in leaders {
+                for (_, leader_socket, _) in leaders {
                     let mc = manager_clone.clone();
                     tokio::spawn(async move {
                         mc.get_or_create_connection(&leader_socket).await.ok();
@@ -97,16 +97,16 @@ impl BifrostServer {
         info!("Listening for WebTransport connections");
         info!("Waiting for first connection");
 
-        let manager_clone = tpu_manager.clone();
-        tokio::spawn(async move {
-            loop {
-                match manager_clone.send_transaction(&[]).await {
-                    Ok(_) => info!("TPU connection healthy"),
-                    Err(e) => log::error!("TPU health check failed: {}", e),
-                };
-                tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
-            }
-        });
+        // let manager_clone = tpu_manager.clone();
+        // tokio::spawn(async move {
+        //     loop {
+        //         match manager_clone.send_transaction(&[]).await {
+        //             Ok(_) => info!("TPU connection healthy"),
+        //             Err(e) => log::error!("TPU health check failed: {}", e),
+        //         };
+        //         tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+        //     }
+        // });
 
         while let Some(request) = server.accept().await {
             info!("Server received request: {}", request.url());
