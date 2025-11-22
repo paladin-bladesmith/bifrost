@@ -1,6 +1,7 @@
 use anyhow::Context;
 use solana_client::rpc_client::RpcClient;
 use solana_sdk::{
+    pubkey::Pubkey,
     signature::{Keypair, Signer},
     transaction::Transaction,
 };
@@ -10,16 +11,9 @@ use url::Url;
 
 const BIFROST_URL: &str = "https://127.0.0.1:4433";
 const CERT_PATH: &str = "certs/cert.pem";
-const RPC_URL: &str = "https://api.testnet.solana.com"; // For Airdrop
+const RPC_URL: &str = "https://api.devnet.solana.com";
+
 const LAMPORTS_PER_SOL: u64 = 1_000_000_000;
-const TEST_KEYPAIR1: [u8; 32] = [
-    143, 239, 226, 151, 40, 210, 184, 162, 99, 53, 65, 216, 6, 120, 57, 199, 209, 74, 234, 182, 12,
-    47, 217, 197, 97, 253, 227, 181, 80, 28, 231, 32,
-];
-const TEST_KEYPAIR2: [u8; 32] = [
-    220, 94, 77, 130, 91, 80, 102, 186, 9, 108, 173, 197, 10, 39, 74, 254, 32, 141, 209, 212, 46,
-    109, 223, 122, 172, 67, 237, 37, 38, 102, 26, 7,
-];
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -32,7 +26,7 @@ async fn main() -> anyhow::Result<()> {
 
     let mut success = vec![];
     for _ in 0..10 {
-        let transaction = create_test_transaction().await?;
+        let transaction = create_test_without_airdrop().await?;
         println!(
             "Created transaction with signature: {}",
             transaction.signatures[0]
@@ -51,6 +45,18 @@ async fn main() -> anyhow::Result<()> {
     );
 
     Ok(())
+}
+
+async fn create_test_without_airdrop() -> anyhow::Result<Transaction> {
+    let rpc_client = RpcClient::new(RPC_URL.to_string());
+
+    let payer = Keypair::from_base58_string(
+        "",
+    );
+
+    println!("Payer {}", payer.pubkey());
+
+    build_transfer_transaction(&rpc_client, &payer)
 }
 
 /// Connects to Bifrost WebTransport server.
@@ -78,10 +84,10 @@ async fn connect_to_bifrost() -> anyhow::Result<web_transport_quinn::Session> {
 }
 
 /// Creates a test transaction by requesting an airdrop and transferring funds.
-async fn create_test_transaction() -> anyhow::Result<Transaction> {
+async fn _create_test_transaction() -> anyhow::Result<Transaction> {
     let rpc_client = RpcClient::new(RPC_URL.to_string());
 
-    let payer = Keypair::new_from_array(TEST_KEYPAIR1);
+    let payer = Keypair::new();
     println!("Generated keypair: {}", payer.pubkey());
 
     // _request_and_confirm_airdrop(&rpc_client, &payer).await?;
@@ -99,10 +105,8 @@ async fn create_test_transaction() -> anyhow::Result<Transaction> {
 }
 
 /// Requests an airdrop and waits for confirmation.
-/// NOTE: For some reason this was failing, in my opinion a better way would be to create 2 test pubkeys
-/// request airdrop on website to one of them, and switch bettwen them when it gets empty.
 async fn _request_and_confirm_airdrop(client: &RpcClient, keypair: &Keypair) -> anyhow::Result<()> {
-    let airdrop_amount = 2 * LAMPORTS_PER_SOL;
+    let airdrop_amount = 1 * LAMPORTS_PER_SOL;
 
     println!(
         "Requesting airdrop of {} SOL",
@@ -130,7 +134,7 @@ fn build_transfer_transaction(client: &RpcClient, payer: &Keypair) -> anyhow::Re
         .get_minimum_balance_for_rent_exemption(0)
         .context("Failed to get rent exemption amount")?;
 
-    let recipient = Keypair::new_from_array(TEST_KEYPAIR2).pubkey();
+    let recipient = Pubkey::new_unique();
     let transfer_amount = rent_exempt + 100_000; // Rent-exempt + 100k lamports
 
     println!("Transferring {} lamports to {}", transfer_amount, recipient);
@@ -169,8 +173,6 @@ async fn send_transaction(
 
     send.finish().context("Failed to finish send stream")?;
 
-    // NOTE: Transaction might have been sent, but doesn't mean it was able to land.
-    // To fully confirm, you need to check on chain
     let response = recv
         .read_to_end(1024)
         .await
