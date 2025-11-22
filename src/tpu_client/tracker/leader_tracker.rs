@@ -1,18 +1,18 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use anyhow::{Context, Result};
 use futures_util::stream::StreamExt;
-use log::info;
+use log::{error, info, warn};
 use solana_client::nonblocking::pubsub_client::PubsubClient;
 use solana_client::nonblocking::rpc_client::RpcClient;
 use tokio::sync::RwLock;
-use tokio::time::Instant;
 
 use crate::tpu_client::tracker::schedule_tracking::ScheduleTracker;
 use crate::tpu_client::tracker::slots_tracker::SlotsTracker;
 
-pub const RPC_URL: &str = "https://api.testnet.solana.com";
-const WS_RPC_URL: &str = "wss://api.testnet.solana.com/";
+pub const RPC_URL: &str = "https://api.devnet.solana.com";
+const WS_RPC_URL: &str = "wss://api.devnet.solana.com/";
 
 /**
  * We have 3 actions that are needed in order to track leaders properly:
@@ -29,7 +29,7 @@ const WS_RPC_URL: &str = "wss://api.testnet.solana.com/";
  * and the IPs can change anytime, this way we are not locking the schedule while doing ip updates.
 **/
 
-#[derive(Default, Debug)]
+#[derive(Debug)]
 pub struct LeaderTracker {
     pub slots_tracker: RwLock<SlotsTracker>,
     schedule_tracker: RwLock<ScheduleTracker>,
@@ -37,168 +37,251 @@ pub struct LeaderTracker {
 }
 
 impl LeaderTracker {
-    pub async fn new() -> Self {
-        Self {
+    pub async fn new() -> Result<Self> {
+        let rpc_client = RpcClient::new(RPC_URL.to_string());
+
+        let schedule_tracker = ScheduleTracker::new(&rpc_client)
+            .await
+            .context("Failed to initialize schedule tracker")?;
+
+        Ok(Self {
             slots_tracker: RwLock::new(SlotsTracker::new()),
-            schedule_tracker: RwLock::new(ScheduleTracker::new().await),
-            leader_sockets: RwLock::new(HashMap::default()),
-        }
+            schedule_tracker: RwLock::new(schedule_tracker),
+            leader_sockets: RwLock::new(HashMap::new()),
+        })
     }
 
-    pub async fn get_future_leaders(&self, slots_amount: u64) -> Vec<(String, String)> {
+    pub async fn get_future_leaders(&self, start: u64, end: u64) -> Vec<(String, String, u64)> {
+        // Acquire all locks together for consistent view
         let slot_tracker = self.slots_tracker.read().await;
-        let curr_slot = slot_tracker.get_slot();
-        drop(slot_tracker);
+        let schedule_tracker = self.schedule_tracker.read().await;
+        let leader_sockets = self.leader_sockets.read().await;
+
+        let curr_slot = slot_tracker.current_slot();
 
         if curr_slot == 0 {
             return vec![];
         }
 
-        let mut leaders = vec![];
-        let schedule_tracker = self.schedule_tracker.read().await;
-        let leader_sockets = self.leader_sockets.read().await;
+        // Validate we're in the current epoch
+        if curr_slot < schedule_tracker.current_epoch_slot_start()
+            || curr_slot >= schedule_tracker.next_epoch_slot_start()
+        {
+            warn!(
+                "Current slot {} is outside epoch range [{}, {})",
+                curr_slot,
+                schedule_tracker.current_epoch_slot_start(),
+                schedule_tracker.next_epoch_slot_start()
+            );
+            return vec![];
+        }
 
-        // Get current leader and next slot leader if different leader
-        for i in 0..slots_amount {
-            // Get the index of the slot
-            let slot_index = (curr_slot + i - schedule_tracker.curr_epoch_slot_start) as usize;
+        let mut leaders = Vec::new();
+        let mut seen = HashSet::new();
 
-            // If we have this index in our schedule and not a duplicate add to leaders vector
-            if let Some(leader) = schedule_tracker.curr_schedule.get(&slot_index)
-                && let Some(leader_socket) = leader_sockets.get(leader)
-                && !leaders.contains(&(leader.to_string(), leader_socket.to_string()))
-            {
-                leaders.push((leader.clone(), leader_socket.clone()));
+        for i in start..end {
+            let target_slot = match curr_slot.checked_add(i) {
+                Some(s) => s,
+                None => break, // Overflow protection
+            };
+
+            // Skip if out of current epoch range
+            if target_slot >= schedule_tracker.next_epoch_slot_start() {
+                break;
+            }
+
+            // Convert absolute slot to epoch-relative index
+            let slot_index = match schedule_tracker.slot_to_index(target_slot) {
+                Some(idx) => idx,
+                None => continue,
+            };
+
+            // Get leader for this slot
+            if let Some(leader_pubkey) = schedule_tracker.get_leader_for_slot_index(slot_index) {
+                // Deduplicate - only add each leader once
+                if !seen.insert(leader_pubkey.to_string()) {
+                    continue;
+                }
+
+                match leader_sockets.get(leader_pubkey) {
+                    Some(socket) => {
+                        leaders.push((leader_pubkey.to_string(), socket.clone(), curr_slot));
+                    }
+                    None => {
+                        warn!("Leader {} has no known socket address", leader_pubkey);
+                    }
+                }
             }
         }
 
         leaders
     }
 
-    /// Get the current and next leaders
-    /// Output = (leader identity, leader socket)
-    pub async fn get_leaders(&self) -> Vec<(String, String)> {
-        self.get_future_leaders(2).await
+    /// Get the current leader, and next leader if close to leader switch
+    ///
+    /// Output = Vec<(leader identity, leader socket, current slot)>
+    pub async fn get_leaders(&self) -> Vec<(String, String, u64)> {
+        self.get_future_leaders(0, 2).await
     }
 
     /// Get all cluster node leader IPs
-    /// TODO: We want to do period ip updates for the schedules to keep ips up to date
-    /// and not try to connect to a hotswap node or something
-    pub async fn update_leader_sockets(leader_tracker: Arc<LeaderTracker>) {
-        let mut leader_sockets: HashMap<String, String> = HashMap::new();
+    pub async fn update_leader_sockets(leader_tracker: Arc<LeaderTracker>) -> Result<()> {
         let rpc_client = RpcClient::new(RPC_URL.to_string());
 
         let nodes = rpc_client
             .get_cluster_nodes()
             .await
-            .expect("Failed to get cluster nodes");
+            .context("Failed to fetch cluster nodes")?;
 
-        nodes.iter().for_each(|node| {
-            if let Some(tpu_quic) = node.tpu_quic {
-                leader_sockets.insert(node.pubkey.to_string(), tpu_quic.to_string());
-            }
-        });
+        let mut new_sockets = HashMap::new();
 
-        let mut ls = leader_tracker.leader_sockets.write().await;
-        *ls = leader_sockets;
-    }
-
-    /// Run the slot updates listener
-    pub async fn run(leader_tracker: Arc<LeaderTracker>) {
-        let ws_client = PubsubClient::new(WS_RPC_URL).await.unwrap();
-
-        let (mut slot_notifications, _unsubscribe) =
-            ws_client.slot_updates_subscribe().await.unwrap();
-        info!("Listening for slot updates...\n");
-
-        while let Some(slot_event) = slot_notifications.next().await {
-            let mut slot_tracker_lock = leader_tracker.slots_tracker.write().await;
-
-            // Update slot tracker
-            if let None = slot_tracker_lock.record(slot_event) {
-                continue;
-            }
-
-            let curr_slot = slot_tracker_lock.get_slot();
-            drop(slot_tracker_lock);
-
-            // If slot is from next epoch, update schedule
-            let mut schedule_tracker = leader_tracker.schedule_tracker.write().await;
-
-            if curr_slot >= schedule_tracker.next_epoch_slot_start {
-                // curr epoch slot start
-                schedule_tracker.curr_epoch_slot_start = schedule_tracker.next_epoch_slot_start;
-
-                // Set next epoch slot start
-                schedule_tracker.next_epoch_slot_start =
-                    schedule_tracker.next_epoch_slot_start + schedule_tracker.slots_in_epoch;
-
-                // set curr schedule to next schedule
-                schedule_tracker.curr_schedule =
-                    std::mem::take(&mut schedule_tracker.next_schedule);
-
-                let next_epoch_slot_start = schedule_tracker.next_epoch_slot_start;
-                drop(schedule_tracker);
-
-                // we asynchronously update the next schedule with minimal locking
-                // because we have the whole epoch to update it.
-                let leader_tracker_clone = leader_tracker.clone();
-                tokio::spawn(async move {
-                    let rpc_client = RpcClient::new(RPC_URL.to_string());
-
-                    let next_schedule = ScheduleTracker::get_leader_schedule(
-                        &rpc_client,
-                        Some(next_epoch_slot_start),
-                    )
-                    .await;
-                    let mut schedule_tracker = leader_tracker_clone.schedule_tracker.write().await;
-                    schedule_tracker.next_schedule = next_schedule;
-                });
+        for node in nodes {
+            if let (Some(tpu_quic), Some(gossip)) = (node.tpu_quic, node.gossip) {
+                new_sockets.insert(
+                    node.pubkey.to_string(),
+                    format!("{}:{}", gossip.ip(), tpu_quic.port()),
+                );
             }
         }
 
-        // TODO: Handle closing the subscription properly
+        info!("Updated sockets for {} validators", new_sockets.len());
+
+        let mut sockets = leader_tracker.leader_sockets.write().await;
+        *sockets = new_sockets; // Move instead of clone
+
+        Ok(())
+    }
+
+    /// Run the slot updates listener
+    pub async fn run(leader_tracker: Arc<LeaderTracker>) -> Result<()> {
+        let ws_client = PubsubClient::new(WS_RPC_URL)
+            .await
+            .context("Failed to connect to WebSocket")?;
+
+        let (mut slot_notifications, _unsubscribe) = ws_client
+            .slot_updates_subscribe()
+            .await
+            .context("Failed to subscribe to slot updates")?;
+
+        info!("Listening for slot updates...");
+
+        while let Some(slot_event) = slot_notifications.next().await {
+            if let Err(e) = Self::handle_slot_event(&leader_tracker, slot_event).await {
+                error!("Error handling slot event: {}", e);
+                // Continue processing other events
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Handles a single slot update event.
+    async fn handle_slot_event(
+        leader_tracker: &Arc<LeaderTracker>,
+        slot_event: solana_client::rpc_response::SlotUpdate,
+    ) -> Result<()> {
+        // Record the slot event and get updated slot number
+        let curr_slot = {
+            let mut slot_tracker = leader_tracker.slots_tracker.write().await;
+            match slot_tracker.record(slot_event) {
+                Some(slot) => slot,
+                None => return Ok(()), // Ignored event type
+            }
+        };
+
+        // Check if we need to rotate to next epoch
+        let needs_rotation = {
+            let schedule_tracker = leader_tracker.schedule_tracker.read().await;
+            curr_slot >= schedule_tracker.next_epoch_slot_start()
+        };
+
+        if needs_rotation {
+            Self::rotate_epoch(leader_tracker, curr_slot).await?;
+        }
+
+        Ok(())
+    }
+
+    /// Rotates the schedule to the next epoch and fetches the new next_schedule.
+    async fn rotate_epoch(leader_tracker: &Arc<LeaderTracker>, curr_slot: u64) -> Result<()> {
+        let rpc_client = RpcClient::new(RPC_URL.to_string());
+
+        let mut schedule_tracker = leader_tracker.schedule_tracker.write().await;
+
+        
+        info!(
+            "Rotating epoch: {} -> {}",
+            schedule_tracker.current_epoch_slot_start(),
+            schedule_tracker.next_epoch_slot_start()
+        );
+
+        // Use the built-in rotation method
+        match schedule_tracker.maybe_rotate(curr_slot, &rpc_client).await {
+            Ok(true) => {
+                info!("Successfully rotated to next epoch");
+            }
+            Ok(false) => {
+                // Shouldn't happen since we checked needs_rotation, but handle it
+                warn!("Rotation not needed despite check");
+            }
+            Err(e) => {
+                error!("Failed to rotate epoch: {}", e);
+                return Err(e).context("Epoch rotation failed");
+            }
+        }
+
+        Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
-
-    use tokio::time::sleep;
-
     use super::*;
+    use std::time::Duration;
+    use tokio::time::sleep;
 
     #[tokio::test]
     #[ignore]
     async fn test_get_rpc_leader_schedule() {
-        let leader_tracker: Arc<LeaderTracker> = Arc::new(LeaderTracker::new().await);
-
-        let leader_tracker_clone = leader_tracker.clone();
-        tokio::spawn(async move { LeaderTracker::run(leader_tracker_clone).await });
+        let leader_tracker = Arc::new(
+            LeaderTracker::new()
+                .await
+                .expect("Failed to initialize LeaderTracker"),
+        );
 
         let leader_tracker_clone = leader_tracker.clone();
         tokio::spawn(async move {
-            LeaderTracker::update_leader_sockets(leader_tracker_clone).await;
+            if let Err(e) = LeaderTracker::run(leader_tracker_clone).await {
+                eprintln!("Run error: {}", e);
+            }
+        });
 
-            sleep(Duration::from_secs(60)).await;
+        let leader_tracker_clone = leader_tracker.clone();
+        tokio::spawn(async move {
+            loop {
+                if let Err(e) =
+                    LeaderTracker::update_leader_sockets(leader_tracker_clone.clone()).await
+                {
+                    eprintln!("Socket update error: {}", e);
+                }
+                sleep(Duration::from_secs(60)).await;
+            }
         });
 
         loop {
             sleep(Duration::from_millis(400)).await;
 
-            let lt = leader_tracker.slots_tracker.read().await;
-            let curr_slot = lt.get_slot();
+            let curr_slot = {
+                let lt = leader_tracker.slots_tracker.read().await;
+                lt.current_slot()
+            };
+
             if curr_slot == 0 {
                 continue;
             }
-            drop(lt);
 
-            println!(
-                "Current Slot: {},leaders: {:?}",
-                curr_slot,
-                leader_tracker.get_leaders().await
-            );
+            let leaders = leader_tracker.get_leaders().await;
+            println!("Current Slot: {}, leaders: {:?}", curr_slot, leaders);
         }
     }
 }

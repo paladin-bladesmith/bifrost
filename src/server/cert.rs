@@ -49,10 +49,7 @@ pub fn load_certificates(
         .context("Failed to parse private key")?
         .context("No private key found")?;
 
-    info!(
-        "Loaded {} certificate(s) and private key",
-        cert_chain.len()
-    );
+    info!("Loaded {} certificate(s) and private key", cert_chain.len());
 
     Ok((cert_chain, private_key))
 }

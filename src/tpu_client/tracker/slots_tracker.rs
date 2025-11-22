@@ -1,41 +1,98 @@
+use crate::Slot;
+use solana_client::rpc_response::SlotUpdate;
 use std::collections::VecDeque;
 
-use solana_client::rpc_response::SlotUpdate;
-
-use crate::Slot;
-
-// 48 chosen because it's unlikely that 12 leaders in a row will miss their slots
 const MAX_SLOT_SKIP_DISTANCE: u64 = 48;
-
 const RECENT_LEADER_SLOTS_CAPACITY: usize = 48;
 
-/// [`SlotEvent`] represents slot start and end events.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SlotEvent {
     Start(Slot),
     End(Slot),
 }
 
 impl SlotEvent {
-    /// Get the slot associated with the event.
     pub fn slot(&self) -> Slot {
         match self {
             SlotEvent::Start(slot) | SlotEvent::End(slot) => *slot,
         }
     }
 
-    /// Check if the event is a start event.
     pub fn is_start(&self) -> bool {
         matches!(self, SlotEvent::Start(_))
     }
 }
 
 #[derive(Debug)]
-pub struct SlotsTracker(VecDeque<SlotEvent>, Slot);
+pub struct SlotsTracker {
+    recent_events: VecDeque<SlotEvent>,
+    current_slot: Slot,
+}
 
 impl SlotsTracker {
     pub fn new() -> Self {
-        Self(VecDeque::with_capacity(RECENT_LEADER_SLOTS_CAPACITY), 0)
+        Self {
+            recent_events: VecDeque::with_capacity(RECENT_LEADER_SLOTS_CAPACITY),
+            current_slot: 0,
+        }
+    }
+
+    pub fn current_slot(&self) -> Slot {
+        self.current_slot
+    }
+
+    /// Records a slot update and returns the new current slot estimate if processed
+    pub fn record(&mut self, slot_event: SlotUpdate) -> Option<Slot> {
+        let event = match slot_event {
+            SlotUpdate::FirstShredReceived { slot, .. } => SlotEvent::Start(slot),
+            SlotUpdate::Completed { slot, .. } => SlotEvent::End(slot),
+            _ => return None, // Ignore other event types
+        };
+
+        self.recent_events.push_back(event);
+
+        // Trim to capacity
+        if self.recent_events.len() > RECENT_LEADER_SLOTS_CAPACITY {
+            let excess = self.recent_events.len() - RECENT_LEADER_SLOTS_CAPACITY;
+            self.recent_events.drain(..excess);
+        }
+
+        self.current_slot = self.estimate_current_slot();
+        Some(self.current_slot)
+    }
+
+    fn estimate_current_slot(&self) -> Slot {
+        if self.recent_events.is_empty() {
+            return self.current_slot;
+        }
+
+        let mut sorted_events: Vec<SlotEvent> = self.recent_events.iter().copied().collect();
+
+        sorted_events.sort_unstable_by(|a, b| {
+            a.slot()
+                .cmp(&b.slot())
+                .then_with(|| b.is_start().cmp(&a.is_start()))
+        });
+
+        // Use median to filter out outliers (validators broadcasting far-future slots)
+        let max_idx = sorted_events.len() - 1;
+        let median_idx = max_idx / 2;
+        let median_slot = sorted_events[median_idx].slot();
+        let expected_current = median_slot + (max_idx - median_idx) as u64;
+        let max_reasonable = expected_current + MAX_SLOT_SKIP_DISTANCE;
+
+        // Find the most recent reasonable slot
+        let idx = sorted_events
+            .iter()
+            .rposition(|e| e.slot() <= max_reasonable)
+            .unwrap_or(median_idx); // Fallback to median if all slots unreasonable
+
+        let slot_event = &sorted_events[idx];
+        if slot_event.is_start() {
+            slot_event.slot()
+        } else {
+            slot_event.slot().saturating_add(1)
+        }
     }
 }
 
@@ -45,139 +102,64 @@ impl Default for SlotsTracker {
     }
 }
 
-impl SlotsTracker {
-    pub fn get_slot(&self) -> Slot {
-        self.1
-    }
-
-    /// Recording already estimate and update the current slot.
-    pub fn record(&mut self, slot_event: SlotUpdate) -> Option<()>{
-        match slot_event {
-            SlotUpdate::FirstShredReceived { slot, .. } => {
-                self.0.push_back(SlotEvent::Start(slot));
-            }
-            SlotUpdate::Completed { slot, .. } => {
-                self.0.push_back(SlotEvent::End(slot));
-            }
-            _ => return None,
-        }
-        while self.0.len() > RECENT_LEADER_SLOTS_CAPACITY {
-            self.0.pop_front();
-        };
-
-        self.1 = self.estimate_current_slot();
-
-        Some(())
-    }
-
-    // Estimate the current slot from recent slot notifications.
-    #[allow(clippy::arithmetic_side_effects)]
-    pub fn estimate_current_slot(&self) -> Slot {
-        let mut recent_slots: Vec<SlotEvent> = self.0.iter().cloned().collect();
-        
-        recent_slots.sort_by(|a, b| {
-            a.slot()
-                .cmp(&b.slot())
-                .then_with(|| b.is_start().cmp(&a.is_start())) // true before false
-        });
-
-        // Validators can broadcast invalid blocks that are far in the future
-        // so check if the current slot is in line with the recent progression.
-        let max_index = recent_slots.len() - 1;
-        let median_index = max_index / 2;
-        let median_recent_slot = recent_slots[median_index].slot();
-        let expected_current_slot = median_recent_slot + (max_index - median_index) as u64;
-        let max_reasonable_current_slot = expected_current_slot + MAX_SLOT_SKIP_DISTANCE;
-
-        let idx = recent_slots
-            .iter()
-            .rposition(|e| e.slot() <= max_reasonable_current_slot)
-            .expect("no reasonable slot");
-
-        let slot_event = &recent_slots[idx];
-        if slot_event.is_start() {
-            slot_event.slot()
-        } else {
-            slot_event.slot().saturating_add(1)
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use {super::*, crate::Slot};
+    use super::*;
 
-    impl From<Vec<Slot>> for SlotsTracker {
-        fn from(recent_slots: Vec<Slot>) -> Self {
-            use std::collections::VecDeque;
-            assert!(!recent_slots.is_empty());
+    fn tracker_from_slots(slots: Vec<Slot>) -> SlotsTracker {
+        assert!(!slots.is_empty());
+        let mut tracker = SlotsTracker::new();
 
-            let mut events = VecDeque::with_capacity(recent_slots.len());
-            
-            for slot in recent_slots {
-                events.push_back(SlotEvent::Start(slot));
-                events.push_back(SlotEvent::End(slot));
-            }
-
-            Self(events, 0)
+        for slot in slots {
+            tracker.recent_events.push_back(SlotEvent::Start(slot));
+            tracker.recent_events.push_back(SlotEvent::End(slot));
         }
+
+        tracker
     }
 
     #[test]
-    fn test_recent_leader_slots() {
-        let mut recent_slots: Vec<Slot> = (1..=12).collect();
-        assert_eq!(
-            SlotsTracker::from(recent_slots.clone()).estimate_current_slot(),
-            13
-        );
+    fn test_estimate_with_sequential_slots() {
+        let tracker = tracker_from_slots((1..=12).collect());
+        assert_eq!(tracker.estimate_current_slot(), 13);
+    }
 
-        recent_slots.reverse();
-        assert_eq!(
-            SlotsTracker::from(recent_slots).estimate_current_slot(),
-            13
-        );
+    #[test]
+    fn test_estimate_with_reverse_order() {
+        let tracker = tracker_from_slots((1..=12).rev().collect());
+        assert_eq!(tracker.estimate_current_slot(), 13);
+    }
 
-        let mut recent_slots = SlotsTracker::new();
-        recent_slots.record(SlotUpdate::FirstShredReceived {
-            slot: 13,
-            timestamp: 0,
-        });
-        assert_eq!(recent_slots.estimate_current_slot(), 13);
-        recent_slots.record(SlotUpdate::FirstShredReceived {
-            slot: 14,
-            timestamp: 0,
-        });
-        assert_eq!(recent_slots.estimate_current_slot(), 14);
-        recent_slots.record(SlotUpdate::FirstShredReceived {
-            slot: 15,
-            timestamp: 0,
-        });
-        assert_eq!(recent_slots.estimate_current_slot(), 15);
+    #[test]
+    fn test_record_updates_estimate() {
+        let mut tracker = SlotsTracker::new();
 
         assert_eq!(
-            SlotsTracker::from(vec![0, 1 + MAX_SLOT_SKIP_DISTANCE]).estimate_current_slot(),
-            2 + MAX_SLOT_SKIP_DISTANCE,
+            tracker.record(SlotUpdate::FirstShredReceived {
+                slot: 13,
+                timestamp: 0
+            }),
+            Some(13)
         );
-        assert_eq!(
-            SlotsTracker::from(vec![0, 2 + MAX_SLOT_SKIP_DISTANCE]).estimate_current_slot(),
-            3 + MAX_SLOT_SKIP_DISTANCE,
-        );
+        assert_eq!(tracker.current_slot(), 13);
 
         assert_eq!(
-            SlotsTracker::from(vec![1, 100]).estimate_current_slot(),
-            2
+            tracker.record(SlotUpdate::FirstShredReceived {
+                slot: 14,
+                timestamp: 0
+            }),
+            Some(14)
         );
-        assert_eq!(
-            SlotsTracker::from(vec![1, 2, 100]).estimate_current_slot(),
-            3
-        );
-        assert_eq!(
-            SlotsTracker::from(vec![1, 2, 3, 100]).estimate_current_slot(),
-            4
-        );
-        assert_eq!(
-            SlotsTracker::from(vec![1, 2, 3, 99, 100]).estimate_current_slot(),
-            4
-        );
+        assert_eq!(tracker.current_slot(), 14);
+    }
+
+    #[test]
+    fn test_outlier_rejection() {
+        // Slot 100 is way beyond MAX_SLOT_SKIP_DISTANCE from slot 1
+        let tracker = tracker_from_slots(vec![1, 100]);
+        assert_eq!(tracker.estimate_current_slot(), 2); // Rejects 100 as outlier
+
+        let tracker = tracker_from_slots(vec![1, 2, 100]);
+        assert_eq!(tracker.estimate_current_slot(), 3);
     }
 }

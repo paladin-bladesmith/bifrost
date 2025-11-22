@@ -1,9 +1,8 @@
+use crate::{constants::MAX_TRANSACTION_SIZE, tpu_client::TpuConnectionManager};
 use anyhow::{Context, Result};
 use log::info;
 use solana_sdk::transaction::Transaction;
 use std::sync::Arc;
-use crate::{constants::{DEFAULT_TPU_ADDRESS, MAX_TRANSACTION_SIZE}, tpu_client::TpuConnectionManager};
-
 
 /// Handles an individual WebTransport session.
 ///
@@ -42,20 +41,21 @@ pub async fn handle_session(
                 info!("Received transaction: {} bytes", tx_data.len());
 
                 // Deserialize at the boundary - fail fast if invalid
-                let transaction: Transaction = bincode::deserialize(&tx_data)
-                    .context("Failed to deserialize transaction")?;
+                let transaction: Transaction =
+                    bincode::deserialize(&tx_data).context("Failed to deserialize transaction")?;
 
                 info!(
                     "Transaction signature: {}, accounts: {}",
-                    transaction.signatures.first()
+                    transaction
+                        .signatures
+                        .first()
                         .map(|s| s.to_string())
                         .unwrap_or_else(|| "none".to_string()),
                     transaction.message.account_keys.len()
                 );
 
                 // Forward the deserialized transaction to TPU
-                info!("Forwarding transaction to TPU at {}", DEFAULT_TPU_ADDRESS);
-                match tpu_manager.send_transaction(DEFAULT_TPU_ADDRESS, &tx_data).await {
+                match tpu_manager.send_transaction(&tx_data).await {
                     Ok(confirmation) => {
                         info!(
                             "Transaction forwarded successfully (latency: {:?})",

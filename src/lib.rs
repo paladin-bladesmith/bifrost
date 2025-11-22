@@ -27,10 +27,9 @@
 //! ```
 //!
 
-
+pub mod constants;
 pub mod server;
 pub mod tpu_client;
-pub mod constants;
 
 pub use server::BifrostServer;
 pub use tpu_client::TpuConnectionManager;
